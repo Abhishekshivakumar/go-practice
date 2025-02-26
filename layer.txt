@@ -1,0 +1,241 @@
+// package main
+
+// import (
+// 	"archive/tar"
+// 	"bytes"
+// 	"crypto/sha256"
+// 	"encoding/hex"
+// 	"encoding/json"
+// 	"fmt"
+// 	"io"
+// 	"os"
+// 	"path/filepath"
+// 	"strings"
+// 	"time"
+// )
+
+// // DockerManifest represents a single image entry from manifest.json.
+// type DockerManifest struct {
+// 	Config   string   `json:"Config"`
+// 	RepoTags []string `json:"RepoTags"`
+// 	Layers   []string `json:"Layers"`
+// }
+
+// // FileInfo holds information about a file in a layer.
+// type FileInfo struct {
+// 	Layer     string // which layer this file belongs to
+// 	Path      string // file path within the layer tar
+// 	Size      int64
+// 	ContentID string // hash of file content
+// }
+
+// // readTarFile extracts a file from an open tar.Reader given a target name.
+// func readTarFile(tr *tar.Reader, target string) ([]byte, error) {
+// 	var buf bytes.Buffer
+// 	for {
+// 		hdr, err := tr.Next()
+// 		if err == io.EOF {
+// 			break
+// 		}
+// 		if err != nil {
+// 			return nil, err
+// 		}
+// 		if hdr.Name == target {
+// 			_, err := io.Copy(&buf, tr)
+// 			return buf.Bytes(), err
+// 		}
+// 	}
+// 	return nil, fmt.Errorf("file %s not found in tar", target)
+// }
+
+// // extractManifestAndLayers reads through the outer tar archive and returns the manifest and list of layer tar file offsets.
+// func extractManifestAndLayerNames(tarPath string) (DockerManifest, []string, error) {
+// 	f, err := os.Open(tarPath)
+// 	if err != nil {
+// 		return DockerManifest{}, nil, err
+// 	}
+// 	defer f.Close()
+
+// 	tr := tar.NewReader(f)
+
+// 	var manifest DockerManifest
+// 	var layers []string
+// 	var manifestFound bool
+
+// 	for {
+// 		hdr, err := tr.Next()
+// 		if err == io.EOF {
+// 			break
+// 		}
+// 		if err != nil {
+// 			return DockerManifest{}, nil, err
+// 		}
+// 		switch hdr.Name {
+// 		case "manifest.json":
+// 			manifestBytes, err := io.ReadAll(tr)
+// 			if err != nil {
+// 				return DockerManifest{}, nil, err
+// 			}
+// 			var manifests []DockerManifest
+// 			if err := json.Unmarshal(manifestBytes, &manifests); err != nil {
+// 				return DockerManifest{}, nil, err
+// 			}
+// 			if len(manifests) > 0 {
+// 				manifest = manifests[0]
+// 				manifestFound = true
+// 			}
+// 		}
+// 	}
+// 	if !manifestFound {
+// 		return DockerManifest{}, nil, fmt.Errorf("manifest.json not found")
+// 	}
+// 	// Get the layer filenames from the manifest.
+// 	layers = manifest.Layers
+// 	return manifest, layers, nil
+// }
+
+// // processLayer opens the tar file again and processes a given layer tar file by name.
+// // It returns a slice of FileInfo entries for each regular file in the layer.
+// func processLayer(outerTarPath, layerName string) ([]FileInfo, error) {
+// 	// Open the outer tar file again (for simplicity; in production, consider indexing offsets).
+// 	f, err := os.Open(outerTarPath)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+// 	defer f.Close()
+
+// 	tr := tar.NewReader(f)
+// 	var layerData []byte
+
+// 	// Find the layer tar file entry in the outer tar.
+// 	for {
+// 		hdr, err := tr.Next()
+// 		if err == io.EOF {
+// 			break
+// 		}
+// 		if err != nil {
+// 			return nil, err
+// 		}
+// 		if hdr.Name == layerName {
+// 			layerData, err = io.ReadAll(tr)
+// 			if err != nil {
+// 				return nil, err
+// 			}
+// 			break
+// 		}
+// 	}
+// 	if layerData == nil {
+// 		return nil, fmt.Errorf("layer %s not found", layerName)
+// 	}
+
+// 	// Now, open the layer tar archive from the bytes.
+// 	layerReader := tar.NewReader(bytes.NewReader(layerData))
+// 	var files []FileInfo
+// 	for {
+// 		hdr, err := layerReader.Next()
+// 		if err == io.EOF {
+// 			break
+// 		}
+// 		if err != nil {
+// 			return nil, err
+// 		}
+// 		// Skip directories and whiteout files (those starting with ".wh.")
+// 		if hdr.Typeflag != tar.TypeReg || strings.HasPrefix(filepath.Base(hdr.Name), ".wh.") {
+// 			continue
+// 		}
+// 		// Read file content to compute hash
+// 		content, err := io.ReadAll(layerReader)
+// 		if err != nil {
+// 			return nil, err
+// 		}
+// 		h := sha256.New()
+// 		_, _ = h.Write(content)
+// 		hashString := hex.EncodeToString(h.Sum(nil))
+// 		fileInfo := FileInfo{
+// 			Layer:     layerName,
+// 			Path:      hdr.Name,
+// 			Size:      hdr.Size,
+// 			ContentID: hashString,
+// 		}
+// 		files = append(files, fileInfo)
+// 	}
+// 	return files, nil
+// }
+
+// func main() {
+// 	tarPath := "my-image.json" // Docker image tar file created by docker save/buildah push
+
+// 	// Extract the manifest and list of layer tar file names.
+// 	manifest, layers, err := extractManifestAndLayerNames(tarPath)
+// 	if err != nil {
+// 		fmt.Printf("Error processing manifest: %v\n", err)
+// 		return
+// 	}
+
+// 	fmt.Println("=== Image Manifest ===")
+// 	fmt.Printf("Config: %s\n", manifest.Config)
+// 	fmt.Printf("RepoTags: %s\n", strings.Join(manifest.RepoTags, ", "))
+// 	fmt.Printf("Layers:\n")
+// 	for _, l := range layers {
+// 		fmt.Printf(" - %s\n", l)
+// 	}
+
+// 	// Process each layer to extract file information.
+// 	allFiles := []FileInfo{}
+// 	var totalLayerSize int64
+// 	for _, layer := range layers {
+// 		files, err := processLayer(tarPath, layer)
+// 		if err != nil {
+// 			fmt.Printf("Error processing layer %s: %v\n", layer, err)
+// 			continue
+// 		}
+// 		// Sum up file sizes for this layer
+// 		for _, fi := range files {
+// 			totalLayerSize += fi.Size
+// 		}
+// 		allFiles = append(allFiles, files...)
+// 	}
+
+// 	// Map to detect duplicate files by content hash.
+// 	duplicateMap := make(map[string][]FileInfo)
+// 	for _, fi := range allFiles {
+// 		duplicateMap[fi.ContentID] = append(duplicateMap[fi.ContentID], fi)
+// 	}
+
+// 	var uniqueSize int64
+// 	duplicateBytes := int64(0)
+
+// 	// Calculate total unique size and duplicate space.
+// 	// For each unique file hash, take the size of one copy.
+// 	for _, files := range duplicateMap {
+// 		if len(files) > 0 {
+// 			uniqueSize += files[0].Size
+// 			if len(files) > 1 {
+// 				// The extra copies are wasted.
+// 				duplicateBytes += int64(len(files)-1) * files[0].Size
+// 			}
+// 		}
+// 	}
+
+// 	fmt.Println("\n=== Analysis ===")
+// 	fmt.Printf("Total bytes in all layers (sum of files): %d bytes\n", totalLayerSize)
+// 	fmt.Printf("Unique bytes (one copy per unique file): %d bytes\n", uniqueSize)
+// 	fmt.Printf("Duplicate (wasted) bytes: %d bytes\n", duplicateBytes)
+
+// 	efficiency := float64(uniqueSize) / float64(totalLayerSize) * 100.0
+// 	fmt.Printf("Efficiency: %.2f%%\n", efficiency)
+
+// 	// For demonstration: list duplicate files
+// 	fmt.Println("\n=== Duplicate Files ===")
+// 	for hash, files := range duplicateMap {
+// 		if len(files) > 1 {
+// 			fmt.Printf("Hash: %s, Size: %d bytes, Occurrences: %d\n", hash, files[0].Size, len(files))
+// 			for _, fi := range files {
+// 				fmt.Printf("   Layer: %s, Path: %s\n", fi.Layer, fi.Path)
+// 			}
+// 		}
+// 	}
+
+// 	// Sleep briefly to allow viewing output in some environments.
+// 	time.Sleep(2 * time.Second)
+// }
