@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"os"
 
 	"github.com/spf13/cobra"
 )
@@ -16,10 +15,10 @@ the amount of wasted space and identifies the offending files from the image.`,
 	Run:  doAnalyzeCmd,
 }
 
-func Execute() {
+func Execute() error {
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Println("Error: while running cmd")
-		os.Exit(0)
+		return fmt.Errorf("error: while executing root command err: %v", err)
 	}
+	return nil
 
 }

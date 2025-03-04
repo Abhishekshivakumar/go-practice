@@ -11,6 +11,8 @@ func NewResolverFromArchive() *archiveResolver {
 	return &archiveResolver{}
 }
 
+var newImageArchiveFunc = NewImageArchive
+
 func (r *archiveResolver) Fetch(path string) (*Image, error) {
 	reader, err := os.Open(path)
 	if err != nil {
@@ -18,7 +20,7 @@ func (r *archiveResolver) Fetch(path string) (*Image, error) {
 	}
 	defer reader.Close()
 
-	img, err := NewImageArchive(reader)
+	img, err := newImageArchiveFunc(reader)
 	if err != nil {
 		return nil, err
 	}

@@ -5,9 +5,9 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path"
 	"strings"
 )
@@ -18,138 +18,169 @@ type ImageArchive struct {
 	layerMap map[string]*FileTree
 }
 
+var (
+	ErrManifestNotFound = errors.New("could not find image manifest")
+	ErrConfigNotFound   = errors.New("could not find image config")
+	ErrLayerParseFailed = errors.New("failed to parse layer tar")
+)
+
+const (
+	tarExtension   = ".tar"
+	tarGzExtension = ".tar.gz"
+	tgzExtension   = ".tgz"
+	manifestFile   = "manifest.json"
+	blobsPrefix    = "blobs/"
+	bufferSize     = 1024
+)
+
 func NewImageArchive(tarFile io.ReadCloser) (*ImageArchive, error) {
 	img := &ImageArchive{
 		layerMap: make(map[string]*FileTree),
 	}
 
 	tarReader := tar.NewReader(tarFile)
-
-	// store discovered json files in a map so we can read the image in one pass
 	jsonFiles := make(map[string][]byte)
 
-	var currentLayer uint
 	for {
 		header, err := tarReader.Next()
-
 		if err == io.EOF {
 			break
 		}
-
 		if err != nil {
-			fmt.Println(err)
-			os.Exit(1)
+			return nil, fmt.Errorf("error reading tar: %w", err)
 		}
 
-		name := header.Name
-
-		// some layer tars can be relative layer symlinks to other layer tars
-		if header.Typeflag == tar.TypeSymlink || header.Typeflag == tar.TypeReg {
-			// For the Docker image format, use file name conventions
-			if strings.HasSuffix(name, ".tar") {
-				currentLayer++
-				layerReader := tar.NewReader(tarReader)
-				tree, err := processLayerTar(name, layerReader)
-				if err != nil {
-					return img, err
-				}
-
-				// add the layer to the image
-				img.layerMap[tree.Name] = tree
-			} else if strings.HasSuffix(name, ".tar.gz") || strings.HasSuffix(name, "tgz") {
-				currentLayer++
-
-				// Add gzip reader
-				gz, err := gzip.NewReader(tarReader)
-				if err != nil {
-					return img, err
-				}
-
-				// Add tar reader
-				layerReader := tar.NewReader(gz)
-
-				// Process layer
-				tree, err := processLayerTar(name, layerReader)
-				if err != nil {
-					return img, err
-				}
-
-				// add the layer to the image
-				img.layerMap[tree.Name] = tree
-			} else if strings.HasSuffix(name, ".json") || strings.HasPrefix(name, "sha256:") {
-				fileBuffer, err := io.ReadAll(tarReader)
-				if err != nil {
-					return img, err
-				}
-				jsonFiles[name] = fileBuffer
-			} else if strings.HasPrefix(name, "blobs/") {
-				// For the OCI-compatible image format (used since Docker 25), use mime sniffing
-				// but limit this to only the blobs/ (containing the config, and the layers)
-
-				// The idea here is that we try various formats in turn, and those tries should
-				// never consume more bytes than this buffer contains so we can start again.
-
-				// 512 bytes ought to be enough (as that's the size of a TAR entry header),
-				// but play it safe with 1024 bytes. This should also include very small layers
-				// (unless they've also been gzipped, but Docker does not appear to do it)
-				buffer := make([]byte, 1024)
-				n, err := io.ReadFull(tarReader, buffer)
-				if err != nil && err != io.ErrUnexpectedEOF {
-					return img, err
-				}
-
-				// Only try reading a TAR if file is "big enough"
-				if n == cap(buffer) {
-					var unwrappedReader io.Reader
-					unwrappedReader, err = gzip.NewReader(io.MultiReader(bytes.NewReader(buffer[:n]), tarReader))
-					if err != nil {
-						// Not a gzipped entry
-						unwrappedReader = io.MultiReader(bytes.NewReader(buffer[:n]), tarReader)
-					}
-
-					// Try reading a TAR
-					layerReader := tar.NewReader(unwrappedReader)
-					tree, err := processLayerTar(name, layerReader)
-					if err == nil {
-						currentLayer++
-						// add the layer to the image
-						img.layerMap[tree.Name] = tree
-						continue
-					}
-				}
-
-				// Not a TAR (or smaller than our buffer), might be a JSON file
-				decoder := json.NewDecoder(bytes.NewReader(buffer[:n]))
-				token, err := decoder.Token()
-				if _, ok := token.(json.Delim); err == nil && ok {
-					// Looks like a JSON object (or array)
-					// XXX: should we add a header.Size check too?
-					fileBuffer, err := io.ReadAll(io.MultiReader(bytes.NewReader(buffer[:n]), tarReader))
-					if err != nil {
-						return img, err
-					}
-					jsonFiles[name] = fileBuffer
-				}
-				// Ignore every other unknown file type
-			}
+		if err := processTarEntry(img, tarReader, header, jsonFiles); err != nil {
+			return nil, err
 		}
 	}
 
-	manifestContent, exists := jsonFiles["manifest.json"]
+	if err := img.loadManifestAndConfig(jsonFiles); err != nil {
+		return nil, err
+	}
+
+	return img, nil
+}
+
+func processTarEntry(img *ImageArchive, tarReader *tar.Reader, header *tar.Header, jsonFiles map[string][]byte) error {
+	name := header.Name
+
+	if header.Typeflag == tar.TypeSymlink || header.Typeflag == tar.TypeReg {
+		ext := path.Ext(name)
+		if ext == tarExtension || ext == tarGzExtension || ext == tgzExtension {
+			return processLayer(img, tarReader, name)
+		} else if path.Ext(name) == ".json" || strings.HasPrefix(name, "sha256:") {
+			return processJSON(tarReader, name, jsonFiles)
+		} else if strings.HasPrefix(name, blobsPrefix) {
+			return processBlob(img, tarReader, name, jsonFiles)
+		}
+	}
+	return nil
+}
+
+func processLayer(img *ImageArchive, tarReader *tar.Reader, name string) error {
+	var layerReader *tar.Reader
+	var err error
+
+	if path.Ext(name) == tarGzExtension || path.Ext(name) == tgzExtension {
+		gz, err := gzip.NewReader(tarReader)
+		if err != nil {
+			return err
+		}
+		layerReader = tar.NewReader(gz)
+	} else {
+		layerReader = tar.NewReader(tarReader)
+	}
+
+	tree, err := processLayerTar(name, layerReader)
+	if err != nil {
+		return fmt.Errorf("%w: %s", ErrLayerParseFailed, name)
+	}
+
+	img.layerMap[tree.Name] = tree
+	return nil
+}
+
+func processJSON(tarReader *tar.Reader, name string, jsonFiles map[string][]byte) error {
+	fileBuffer, err := io.ReadAll(tarReader)
+	if err != nil {
+		return err
+	}
+	jsonFiles[name] = fileBuffer
+	return nil
+}
+
+func processBlob(img *ImageArchive, tarReader *tar.Reader, name string, jsonFiles map[string][]byte) error {
+	buffer := make([]byte, bufferSize)
+	n, err := io.ReadFull(tarReader, buffer)
+	if err != nil && err != io.ErrUnexpectedEOF {
+		return err
+	}
+
+	if n == bufferSize {
+		if err := tryProcessTarBlob(img, bytes.NewReader(buffer[:n]), tarReader, name); err == nil {
+			return nil
+		}
+	}
+
+	return tryProcessJSONBlob(bytes.NewReader(buffer[:n]), tarReader, name, jsonFiles)
+}
+
+func tryProcessTarBlob(img *ImageArchive, bufferReader io.Reader, tarReader io.Reader, name string) error {
+	multiReader := io.MultiReader(bufferReader, tarReader)
+	gzipReader, err := gzip.NewReader(multiReader)
+	if err != nil {
+		// Not a gzipped entry, use the MultiReader directly
+		layerReader := tar.NewReader(multiReader)
+		tree, err := processLayerTar(name, layerReader)
+		if err != nil {
+			return err
+		}
+
+		img.layerMap[tree.Name] = tree
+		return nil
+	}
+
+	// Gzip decompression successful, use the gzipReader
+	layerReader := tar.NewReader(gzipReader)
+	tree, err := processLayerTar(name, layerReader)
+	if err != nil {
+		return err
+	}
+
+	img.layerMap[tree.Name] = tree
+	return nil
+}
+
+func tryProcessJSONBlob(bufferReader io.Reader, tarReader io.Reader, name string, jsonFiles map[string][]byte) error {
+	decoder := json.NewDecoder(bufferReader)
+	token, err := decoder.Token()
+	if _, ok := token.(json.Delim); err == nil && ok {
+		fileBuffer, err := io.ReadAll(io.MultiReader(bufferReader, tarReader))
+		if err != nil {
+			return err
+		}
+		jsonFiles[name] = fileBuffer
+		return nil
+	}
+	return nil
+}
+
+func (img *ImageArchive) loadManifestAndConfig(jsonFiles map[string][]byte) error {
+	manifestContent, exists := jsonFiles[manifestFile]
 	if !exists {
-		return img, fmt.Errorf("could not find image manifest")
+		return ErrManifestNotFound
 	}
 
 	img.manifest = newManifest(manifestContent)
 
 	configContent, exists := jsonFiles[img.manifest.ConfigPath]
 	if !exists {
-		return img, fmt.Errorf("could not find image config")
+		return ErrConfigNotFound
 	}
 
 	img.config = newConfig(configContent)
-
-	return img, nil
+	return nil
 }
 
 func processLayerTar(name string, reader *tar.Reader) (*FileTree, error) {
@@ -184,7 +215,6 @@ func getFileList(tarReader *tar.Reader) ([]FileInfo, error) {
 			return nil, err
 		}
 
-		// always ensure relative path notations are not parsed as part of the filename
 		name := path.Clean(header.Name)
 		if name == "." {
 			continue
@@ -208,7 +238,6 @@ type layer struct {
 	tree    *FileTree
 }
 
-// String represents a layer in a columnar format.
 func (l *layer) ToLayer() *Layer {
 	id := strings.Split(l.tree.Name, "/")[0]
 	return &Layer{
@@ -217,11 +246,11 @@ func (l *layer) ToLayer() *Layer {
 		Command: strings.TrimPrefix(l.history.CreatedBy, "/bin/sh -c "),
 		Size:    l.history.Size,
 		Tree:    l.tree,
-		// todo: query docker api for tags
-		Names:  []string{"(unavailable)"},
-		Digest: l.history.ID,
+		Names:   []string{"(unavailable)"},
+		Digest:  l.history.ID,
 	}
 }
+
 func (img *ImageArchive) ToImage() (*Image, error) {
 	trees := make([]*FileTree, 0)
 
