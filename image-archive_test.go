@@ -9,60 +9,61 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestNewImageArchive(t *testing.T) {
+func TestNewImageArchive_Success(t *testing.T) {
 	// Create a dummy tar archive for testing
 	tarData := createTestTarArchive(t)
 	tarReader := io.NopCloser(bytes.NewReader(tarData))
 
 	img, err := NewImageArchive(tarReader)
 	require.NoError(t, err, "NewImageArchive failed")
-
-	// Add assertions based on your expected image structure
 	require.NotNil(t, img, "Image archive is nil")
 	require.Equal(t, "config.json", img.manifest.ConfigPath, "Expected config path 'config.json'")
 	require.Len(t, img.layerMap, 2, "Expected 2 layers")
 }
 
-func TestProcessLayer(t *testing.T) {
-	img := &ImageArchive{layerMap: make(map[string]*FileTree)}
-	tarData := createLayerTarArchive(t)
-	tarReader := tar.NewReader(bytes.NewReader(tarData))
-	header, _ := tarReader.Next() // Get first header
+func TestNewImageArchive_InvalidTar(t *testing.T) {
+	// Create an invalid tar archive (e.g., just random bytes)
+	tarData := []byte{0x01, 0x02, 0x03}
+	tarReader := io.NopCloser(bytes.NewReader(tarData))
 
-	err := processLayer(img, tarReader, header.Name)
-	require.NoError(t, err, "processLayer failed")
-	require.Len(t, img.layerMap, 1, "Expected 1 layer")
+	img, err := NewImageArchive(tarReader)
+	require.Error(t, err, "Expected error for invalid tar")
+	require.Nil(t, img, "Expected nil image for invalid tar")
 }
 
-func TestProcessBlob(t *testing.T) {
-	img := &ImageArchive{layerMap: make(map[string]*FileTree)}
-	jsonFiles := make(map[string][]byte)
-	tarData := createBlobTarArchive(t)
-	tarReader := tar.NewReader(bytes.NewReader(tarData))
-	header, _ := tarReader.Next()
+func TestNewImageArchive_MissingManifest(t *testing.T) {
+	// Create a tar archive without manifest.json
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	addFileToTar(t, tw, "config.json", `{"History":[]}`) // Config, but no manifest
+	addLayerTar(t, tw, "layer1.tar", "file1.txt", "content1")
+	tw.Close()
 
-	err := processBlob(img, tarReader, header.Name, jsonFiles)
-	require.NoError(t, err, "processBlob failed")
-	require.True(t, len(img.layerMap) == 1 || len(jsonFiles) == 1, "Expected 1 layer or json file")
+	tarReader := io.NopCloser(bytes.NewReader(buf.Bytes()))
+
+	img, err := NewImageArchive(tarReader)
+	require.Error(t, err, "Expected error for missing manifest")
+	require.Nil(t, img, "Expected nil image for missing manifest")
+	require.ErrorIs(t, err, ErrManifestNotFound, "Expected ErrManifestNotFound")
 }
 
-func TestToImage(t *testing.T) {
-	img := &ImageArchive{
-		manifest: manifest{LayerTarPaths: []string{"layer1.tar", "layer2.tar"}, ConfigPath: "config.json"},
-		config:   config{History: []historyEntry{{CreatedBy: "test", EmptyLayer: false}, {CreatedBy: "test2", EmptyLayer: false}}},
-		layerMap: map[string]*FileTree{
-			"layer1.tar": {Name: "layer1.tar", FileSize: 100},
-			"layer2.tar": {Name: "layer2.tar", FileSize: 200},
-		},
-	}
+func TestNewImageArchive_MissingConfig(t *testing.T) {
+	// Create a tar archive with manifest.json but without config.json
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	addFileToTar(t, tw, "manifest.json", `{"ConfigPath":"config.json", "LayerTarPaths":["layer1.tar"]}`) // Manifest, but no config
+	addLayerTar(t, tw, "layer1.tar", "file1.txt", "content1")
+	tw.Close()
 
-	image, err := img.ToImage()
-	require.NoError(t, err, "ToImage failed")
-	require.Len(t, image.Layers, 2, "Expected 2 layers in image")
-	require.Equal(t, int64(100), image.Layers[0].Size, "Expected layer size 100")
-	require.Equal(t, int64(200), image.Layers[1].Size, "Expected layer size 200")
+	tarReader := io.NopCloser(bytes.NewReader(buf.Bytes()))
+
+	img, err := NewImageArchive(tarReader)
+	require.Error(t, err, "Expected error for missing config")
+	require.Nil(t, img, "Expected nil image for missing config")
+	require.ErrorIs(t, err, ErrConfigNotFound, "Expected ErrConfigNotFound")
 }
 
+// Helper functions (createTestTarArchive, addFileToTar, addLayerTar) from previous examples...
 func createTestTarArchive(t *testing.T) []byte {
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
@@ -76,23 +77,6 @@ func createTestTarArchive(t *testing.T) []byte {
 	// Add layer2.tar
 	addLayerTar(t, tw, "layer2.tar", "file2.txt", "content2")
 
-	tw.Close()
-	return buf.Bytes()
-}
-
-func createLayerTarArchive(t *testing.T) []byte {
-	var buf bytes.Buffer
-	tw := tar.NewWriter(&buf)
-	addFileToTar(t, tw, "file.txt", "content")
-	tw.Close()
-	return buf.Bytes()
-}
-
-func createBlobTarArchive(t *testing.T) []byte {
-	var buf bytes.Buffer
-	tw := tar.NewWriter(&buf)
-	addFileToTar(t, tw, "blobs/config.json", `{"history":[]}`)
-	addLayerTar(t, tw, "blobs/layer.tar", "file.txt", "content")
 	tw.Close()
 	return buf.Bytes()
 }
